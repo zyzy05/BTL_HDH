@@ -3,54 +3,32 @@ import time
 import json
 import os
 import tempfile
-from flask import Flask, request, jsonify, abort
+from flask import Flask, request, jsonify
 from datetime import datetime, timezone
-from typing import Dict, Any    
+import requests
 
-# Configurable params (match recommended config)
-HEARTBEAT_INTERVAL = 10      # not enforced on tracker side, peers should use it
-TIMEOUT = 30                 # seconds - consider peer dead if no heartbeat within this
+HEARTBEAT_INTERVAL = 10
+TIMEOUT = 30
 METADATA_FILE = "metadata.json"
 TRACKER_LOG = "tracker.log"
-CHECK_INTERVAL = 10          # how often tracker scans for dead peers
-REPLICATION_HOOK_MODULE = "replication"  # optional module (Người 2)
+CHECK_INTERVAL = 10
+REPLICATION_FACTOR = 2
 
 app = Flask(__name__)
 
-# In-memory metadata structure
-# { "peers": {peer_id: {host, port, last_heartbeat (ts), files: {filename: [chunk_hash...]}, status: "alive"/"dead"} },
-#   "files": { filename: { "chunks": {chunk_hash: [peer_id, ...]}, "size": int, "uploaded_by": peer_id } },
-#   "created_at": timestamp }
 metadata_lock = threading.RLock()
 if os.path.exists(METADATA_FILE):
     try:
         with open(METADATA_FILE, "r", encoding="utf-8") as f:
-            METADATA: Dict[str, Any] = json.load(f)
-    except Exception as e:
-        print(f"[WARN] Could not read {METADATA_FILE}: {e}. Starting with empty metadata.")
+            METADATA = json.load(f)
+    except Exception:
         METADATA = {}
 else:
     METADATA = {}
 
-# ensure keys exist
 METADATA.setdefault("peers", {})
 METADATA.setdefault("files", {})
 METADATA.setdefault("created_at", time.time())
-
-# Try to import replication hook if exists
-_replication_hook = None
-try:
-    import importlib
-    replication_mod = importlib.import_module(REPLICATION_HOOK_MODULE)
-    # expected function: on_peer_down(dead_peer_id: str, metadata: dict, tracker: object)
-    if hasattr(replication_mod, "on_peer_down"):
-        _replication_hook = replication_mod.on_peer_down
-        print("[INFO] Replication hook loaded from replication.py")
-    else:
-        print("[INFO] replication.py present but no on_peer_down() found.")
-except Exception:
-    # module not present or import error — not fatal
-    _replication_hook = None
 
 def log(msg: str):
     ts = datetime.now(timezone.utc).isoformat()
@@ -63,7 +41,6 @@ def log(msg: str):
         pass
 
 def safe_write_metadata():
-    """Write METADATA to METADATA_FILE atomically."""
     with metadata_lock:
         tmpfd, tmppath = tempfile.mkstemp(prefix="meta_", suffix=".json", dir=".")
         try:
@@ -78,7 +55,7 @@ def safe_write_metadata():
             except Exception:
                 pass
 
-def update_peer_heartbeat(peer_id: str, host: str = None, port: int = None, files: Dict[str, Any] = None):
+def update_peer_heartbeat(peer_id: str, host: str = None, port: int = None, files: dict = None):
     now = time.time()
     with metadata_lock:
         peer = METADATA["peers"].setdefault(peer_id, {})
@@ -89,8 +66,6 @@ def update_peer_heartbeat(peer_id: str, host: str = None, port: int = None, file
         if port:
             peer["port"] = int(port)
         if files is not None:
-            # files is mapping filename -> list of chunk hashes OR a list of filenames
-            # we store as filename -> list
             peer_files = {}
             for fn, chunks in files.items():
                 peer_files[fn] = list(chunks) if isinstance(chunks, (list, tuple)) else []
@@ -110,32 +85,8 @@ def mark_peer_dead(peer_id: str):
         METADATA.setdefault("updated_at", time.time())
         safe_write_metadata()
     log(f"Peer marked dead: {peer_id}")
-    # Call replication hook if available
-    try:
-        if _replication_hook:
-            # call in separate thread to avoid blocking
-            threading.Thread(target=_replication_hook, args=(peer_id, METADATA, None), daemon=True).start()
-        else:
-            # If no replication module, just write a task placeholder for manual inspection
-            tasks_path = "replication_tasks.json"
-            task = {"type": "peer_down", "peer_id": peer_id, "time": time.time()}
-            try:
-                if os.path.exists(tasks_path):
-                    with open(tasks_path, "r", encoding="utf-8") as f:
-                        tasks = json.load(f)
-                else:
-                    tasks = []
-            except Exception:
-                tasks = []
-            tasks.append(task)
-            with open(tasks_path, "w", encoding="utf-8") as f:
-                json.dump(tasks, f, indent=2)
-            log(f"Wrote replication placeholder task for dead peer {peer_id} to {tasks_path}")
-    except Exception as e:
-        log(f"Error invoking replication hook for {peer_id}: {e}")
 
 def scan_for_dead_peers_loop():
-    """Background thread: scans heartbeat timestamps and marks dead peers."""
     while True:
         now = time.time()
         to_mark = []
@@ -149,36 +100,49 @@ def scan_for_dead_peers_loop():
             mark_peer_dead(pid)
         time.sleep(CHECK_INTERVAL)
 
-# API endpoints
+def replication_manager_loop():
+    while True:
+        time.sleep(CHECK_INTERVAL)
+        with metadata_lock:
+            for fname, finfo in METADATA.get("files", {}).items():
+                for ch, peers_with_chunk in finfo.get("chunks", {}).items():
+                    alive_peers = [p for p in peers_with_chunk if METADATA["peers"].get(p, {}).get("status")=="alive"]
+                    if len(alive_peers) < REPLICATION_FACTOR and alive_peers:
+                        src = alive_peers[0]
+                        dst_candidates = [p for p in METADATA["peers"] if METADATA["peers"][p]["status"]=="alive" and p not in peers_with_chunk]
+                        if dst_candidates:
+                            dst = dst_candidates[0]
+                            src_peer = METADATA["peers"][src]
+                            dst_peer = METADATA["peers"][dst]
+                            try:
+                                requests.post(f"http://{src_peer['host']}:{src_peer['port']}/replicate", json={
+                                    "file": fname,
+                                    "chunk": ch,
+                                    "dst_host": dst_peer["host"],
+                                    "dst_port": dst_peer["port"],
+                                    "dst_id": dst
+                                }, timeout=5)
+                                log(f"Replication triggered: {fname}/{ch} {src} -> {dst}")
+                            except Exception as e:
+                                log(f"Replication error: {e}")
+        safe_write_metadata()
 
 @app.route("/register", methods=["POST"])
 def register():
-    """
-    Register a new peer.
-    JSON body: { "id": str, "host": str, "port": int, "files": { filename: [chunk_hash,...] } (optional) }
-    """
     data = request.get_json(force=True, silent=True)
-    if not data:
-        return jsonify({"error": "invalid json"}), 400
     peer_id = data.get("id")
     host = data.get("host")
     port = data.get("port")
     files = data.get("files", None)
     if not peer_id or not host or not port:
-        return jsonify({"error": "id, host and port required"}), 400
+        return jsonify({"error": "id, host, port required"}), 400
     update_peer_heartbeat(peer_id, host=host, port=port, files=files)
     log(f"Registered/Updated peer {peer_id} ({host}:{port})")
     return jsonify({"status": "ok", "peer_id": peer_id}), 200
 
 @app.route("/heartbeat", methods=["POST"])
 def heartbeat():
-    """
-    Heartbeat from peer.
-    JSON body: { "id": str, "host": str (optional), "port": int (optional) }
-    """
     data = request.get_json(force=True, silent=True)
-    if not data:
-        return jsonify({"error": "invalid json"}), 400
     peer_id = data.get("id")
     host = data.get("host")
     port = data.get("port")
@@ -189,35 +153,20 @@ def heartbeat():
 
 @app.route("/publish", methods=["POST"])
 def publish():
-    """
-    Peer publishes file metadata to tracker.
-    JSON body: {
-      "id": str,         # peer id
-      "file": str,       # filename
-      "size": int,       # optional
-      "chunks": [ "hash1", "hash2", ... ]  # list of chunk hashes
-    }
-    Tracker updates file->chunk->peer mapping and peer.files
-    """
     data = request.get_json(force=True, silent=True)
-    if not data:
-        return jsonify({"error": "invalid json"}), 400
     peer_id = data.get("id")
     filename = data.get("file")
     chunks = data.get("chunks")
     size = data.get("size", None)
     if not peer_id or not filename or not isinstance(chunks, list):
-        return jsonify({"error": "id, file, chunks (list) required"}), 400
-
+        return jsonify({"error": "id, file, chunks required"}), 400
     now = time.time()
     with metadata_lock:
-        # update peer's file list
         peer = METADATA["peers"].setdefault(peer_id, {})
         peer.setdefault("files", {})
         peer["files"][filename] = list(chunks)
         peer["last_heartbeat"] = now
         peer["status"] = "alive"
-        # update global files map
         file_entry = METADATA["files"].setdefault(filename, {"chunks": {}, "size": size, "uploaded_by": peer_id})
         if size is not None:
             file_entry["size"] = size
@@ -228,22 +177,11 @@ def publish():
                 lst.append(peer_id)
         METADATA["updated_at"] = now
         safe_write_metadata()
-
     log(f"Peer {peer_id} published file {filename} ({len(chunks)} chunks)")
     return jsonify({"status": "ok"}), 200
 
 @app.route("/lookup/<path:filename>", methods=["GET"])
 def lookup(filename):
-    """
-    Return the list of peers that have chunks for the requested file.
-    Response:
-    {
-      "file": filename,
-      "chunks": {
-         "chunk_hash": [ { "peer_id": id, "host": host, "port": port, "status": "alive" }, ... ]
-      }
-    }
-    """
     with metadata_lock:
         fe = METADATA["files"].get(filename)
         if not fe:
@@ -264,43 +202,32 @@ def lookup(filename):
 
 @app.route("/peers", methods=["GET"])
 def peers():
-    """Return peer registry and statuses."""
     with metadata_lock:
         return jsonify(METADATA.get("peers", {})), 200
 
 @app.route("/files", methods=["GET"])
 def files():
-    """Return files metadata."""
     with metadata_lock:
         return jsonify(METADATA.get("files", {})), 200
 
-@app.route("/update_file", methods=["POST"])
-def update_file():
-    """
-    Update file metadata manually.
-    JSON: { "file": str, "chunks": { "hash": [peer_id,...] }, "size": int (optional) }
-    """
+@app.route("/replicate_done", methods=["POST"])
+def replicate_done():
     data = request.get_json(force=True, silent=True)
-    if not data:
-        return jsonify({"error": "invalid json"}), 400
-    filename = data.get("file")
-    chunks_map = data.get("chunks")
-    size = data.get("size", None)
-    if not filename or not isinstance(chunks_map, dict):
-        return jsonify({"error": "file and chunks map required"}), 400
+    file_name = data["file"]
+    chunk_hash = data["chunk"]
+    peer_id = data["peer_id"]
     with metadata_lock:
-        entry = METADATA["files"].setdefault(filename, {"chunks": {}, "size": size})
-        entry["chunks"] = {k: list(v) for k, v in chunks_map.items()}
-        if size is not None:
-            entry["size"] = size
+        if file_name in METADATA["files"]:
+            if chunk_hash not in METADATA["files"][file_name]["chunks"]:
+                METADATA["files"][file_name]["chunks"][chunk_hash] = []
+            if peer_id not in METADATA["files"][file_name]["chunks"][chunk_hash]:
+                METADATA["files"][file_name]["chunks"][chunk_hash].append(peer_id)
         METADATA["updated_at"] = time.time()
         safe_write_metadata()
-    log(f"File {filename} metadata updated manually")
-    return jsonify({"status": "ok"}), 200
+    return jsonify({"status": "ok"})
 
 @app.route("/summary", methods=["GET"])
 def summary():
-    """Short summary used by monitoring scripts."""
     with metadata_lock:
         total_peers = len(METADATA.get("peers", {}))
         alive = sum(1 for p in METADATA.get("peers", {}).values() if p.get("status") == "alive")
@@ -314,17 +241,17 @@ def summary():
         "timestamp": time.time()
     }), 200
 
-# Small health endpoint
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "time": time.time()}), 200
 
-def start_background_scanner():
-    t = threading.Thread(target=scan_for_dead_peers_loop, daemon=True)
-    t.start()
+def start_background_threads():
+    t1 = threading.Thread(target=scan_for_dead_peers_loop, daemon=True)
+    t1.start()
+    t2 = threading.Thread(target=replication_manager_loop, daemon=True)
+    t2.start()
 
 if __name__ == "__main__":
-    # when running as main: start background scanner and Flask
-    start_background_scanner()
+    start_background_threads()
     log("Starting Tracker server on 0.0.0.0:5000")
     app.run(host="0.0.0.0", port=5000, debug=False)
