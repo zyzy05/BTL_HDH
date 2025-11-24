@@ -1,0 +1,8 @@
+[2025-11-24 22:48:33] Socket server listening on 9011
+[2025-11-24 22:48:33] Registered with tracker as peer1 (REST:9001, SOCK:9011)
+[2025-11-24 22:48:33] Socket server listening on 9012
+[2025-11-24 22:48:33] Registered with tracker as peer2 (REST:9002, SOCK:9012)
+[2025-11-24 22:48:36] Replication Manager started.
+[2025-11-24 22:48:41] Under-replicated chunk 7e6313fdca3a7362fcd660b986b335a9c1b8f0ffbca9926d2f1cd8104d9f1540 (1/2)
+[2025-11-24 22:48:41] Received chunk 7e6313... from ('127.0.0.1', 53199)
+[2025-11-24 22:48:41] Sent replicate task to peer1 -> peer2 for 7e6313fdca3a7362fcd660b986b335a9c1b8f0ffbca9926d2f1cd8104d9f1540
